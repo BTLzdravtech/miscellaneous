@@ -2,7 +2,7 @@
 
 .. |company_logo| image:: https://raw.githubusercontent.com/ingadhoc/maintainer-tools/master/resources/adhoc-logo.png
    :alt: ADHOC SA
-   :target: https://www.adhoc.com.ar
+   :target: https://www.adhoc.inc
 
 .. |icon| image:: https://raw.githubusercontent.com/ingadhoc/maintainer-tools/master/resources/adhoc-icon.png
 
@@ -10,36 +10,39 @@
    :target: https://www.gnu.org/licenses/agpl
    :alt: License: AGPL-3
 
-=============
-Report Copies
-=============
+=================
+Export Background
+=================
 
-* Add the posibility to print more than 1 copy for the qweb reports.
+Automatically exports large datasets (>500 records) in background to avoid timeouts.
 
 Installation
 ============
 
-To install this module, you need to:
-
-#. Just install
+Install the module and its dependency: ``base_bg``
 
 Configuration
 =============
 
-To configure this module, you need to:
+Optional: Configure the record threshold in **Settings > Technical > System Parameters**:
 
-#. Don't need any configuration
+* Key: ``export_bg.record_threshold``
+* Default: ``500``
 
 Usage
 =====
 
-To use this module, you need to:
+1. Go to any list view and select records to export
+2. Click **Export** and choose your format (CSV or XLSX)
+3. If records exceed the threshold:
+   - You'll receive a notification: "Export sent to background"
+   - You'll receive a message with download link when ready
 
-#. Just use it.
+For exports under the threshold, it works as normal (instant download).
 
 .. image:: https://odoo-community.org/website/image/ir.attachment/5784_f2813bd/datas
    :alt: Try me on Runbot
-   :target: http://runbot.adhoc.com.ar/
+   :target: https://runbot.dev-adhoc.com/
 
 Bug Tracker
 ===========
@@ -67,4 +70,4 @@ Maintainer
 
 This module is maintained by the |company|.
 
-To contribute to this module, please visit https://www.adhoc.com.ar.
+To contribute to this module, please visit https://www.adhoc.inc.

@@ -1,6 +1,6 @@
 ##############################################################################
 #
-#    Copyright (C) 2020  ADHOC SA  (http://www.adhoc.com.ar)
+#    Copyright (C) 2026  ADHOC SA  (http://www.adhoc.com.ar)
 #    All Rights Reserved.
 #
 #    This program is free software: you can redistribute it and/or modify
@@ -17,25 +17,25 @@
 #    along with this program.  If not, see <http://www.gnu.org/licenses/>.
 #
 ##############################################################################
-
 {
-    "name": "Report Copies",
-    "version": "15.0.1.0.0",
-    "category": "Web & Reports",
-    "sequence": 14,
-    "summary": "",
+    "name": "Export Background",
+    "version": "18.0.1.0.0",
+    "category": "Technical",
     "author": "ADHOC SA",
-    "website": "www.adhoc.com.ar",
+    "website": "https://www.adhoc.com.ar",
     "license": "AGPL-3",
-    "images": [],
+    "summary": "Export large datasets in background to avoid timeouts",
     "depends": [
+        "base_bg",
         "web",
     ],
-    "data": [
-        "views/report_templates.xml",
-        "views/ir_actions_views.xml",
-    ],
-    "installable": False,
+    "data": [],
+    "assets": {
+        "web.assets_backend": [
+            "export_bg/static/src/views/list_controller.js",
+        ],
+    },
+    "installable": True,
     "auto_install": False,
     "application": False,
 }
