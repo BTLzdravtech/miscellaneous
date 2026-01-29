@@ -23,18 +23,18 @@ patch(ListController.prototype, {
                 import_compat: import_compat,
             };
 
-            const method = format === "csv" ? "web_export_csv" : "web_export_xlsx";
             const actionResult = await this.model.orm.call(
                 "ir.model",
-                "bg_enqueue",
-                [method],
+                "web_export",
+                [],
                 {
                     data: JSON.stringify(data),
+                    export_format: format,
                 }
             );
 
-            if (actionResult && actionResult.type === "ir.actions.client") {
-                this.env.services.action.doAction(actionResult);
+            if (actionResult && actionResult[0].type === "ir.actions.client") {
+                this.env.services.action.doAction(actionResult[0]);
             }
         } else {
             await super.downloadExport(...arguments);

@@ -20,11 +20,12 @@ class BgJob(models.Model):
     name = fields.Char(
         string="Job Name",
         required=True,
-        help="Human readable job name",
+        readonly=True,
     )
     state = fields.Selection(
         [
             ("enqueued", "Enqueued"),
+            ("waiting", "Waiting For Previous Job"),
             ("running", "Running"),
             ("done", "Done"),
             ("failed", "Failed"),
@@ -32,34 +33,43 @@ class BgJob(models.Model):
         ],
         default="enqueued",
         required=True,
+        help="Current state of the job",
     )
     model = fields.Char(
         required=True,
+        readonly=True,
         help="The model name on which the job method will be executed",
     )
     method = fields.Char(
         required=True,
+        readonly=True,
         help="The method name to be executed",
     )
     args_json = fields.Json(
+        readonly=True,
         help="Positional arguments for the method call, serialized as JSON",
     )
     kwargs_json = fields.Json(
+        readonly=True,
         help="Keyword arguments for the method call, serialized as JSON",
     )
     context_json = fields.Json(
+        readonly=True,
         help="Context to be used when executing the job, serialized as JSON",
     )
     priority = fields.Integer(
         default=10,
+        readonly=True,
         help="Job priority (lower number means higher priority)",
     )
     max_retries = fields.Integer(
         default=3,
+        readonly=True,
         help="Maximum number of retry attempts",
     )
     retry_count = fields.Integer(
         default=0,
+        readonly=True,
         help="Current number of retry attempts",
     )
     start_time = fields.Datetime(
@@ -80,7 +90,19 @@ class BgJob(models.Model):
         help="Job execution duration in seconds",
     )
     error_message = fields.Text(
+        readonly=True,
         help="Error message from the last failed execution",
+    )
+    batch_key = fields.Char(
+        required=True,
+        readonly=True,
+        index=True,
+        help="Identifier for related jobs in a batch",
+    )
+    next_job_id = fields.Many2one(
+        "bg.job",
+        readonly=True,
+        help="Next job in the batch sequence",
     )
 
     @api.depends("start_time", "end_time")
@@ -99,12 +121,8 @@ class BgJob(models.Model):
         self.ensure_one()
         if self.state != "enqueued":
             raise UserError(_("Only enqueued jobs can be canceled"))
-        self.write(
-            {
-                "state": "canceled",
-                "cancel_time": fields.Datetime.now(),
-            }
-        )
+
+        (self | self._get_next_jobs()).cancel()
 
     def action_retry(self):
         """
@@ -113,13 +131,9 @@ class BgJob(models.Model):
         self.ensure_one()
         if self.state != "failed":
             raise UserError(_("Only failed jobs can be retried"))
-        self.write(
-            {
-                "state": "enqueued",
-                "retry_count": 0,
-                "error_message": False,
-            }
-        )
+
+        self.enqueue(retry=True)
+        self._get_next_jobs().wait()
 
     def action_open_records(self) -> dict:
         """
@@ -138,6 +152,19 @@ class BgJob(models.Model):
             "domain": [("id", "in", records.ids)],
         }
 
+    def action_open_batch_jobs(self) -> dict:
+        """
+        Action to open all jobs in the same batch
+        """
+        self.ensure_one()
+        return {
+            "name": _("Batch Jobs: %s", self.batch_key[:8]),
+            "type": "ir.actions.act_window",
+            "res_model": "bg.job",
+            "view_mode": "list,form",
+            "domain": [("batch_key", "=", self.batch_key)],
+        }
+
     def run(self):
         """
         Executes the job
@@ -146,32 +173,23 @@ class BgJob(models.Model):
         if self.state != "enqueued":
             raise UserError(_("Only enqueued jobs can be executed"))
 
-        self.write(
-            {
-                "state": "running",
-                "start_time": fields.Datetime.now(),
-            }
-        )
+        self.start()
         self.env.cr.commit()  # pylint: disable=invalid-commit
 
         try:
             context = self.context_json or {}
-            context.update({"bg_job": True})
+            context.update({"bg_job": True, "bg_job_id": self.id})
 
             # Extract record IDs if present in kwargs or args
             model = self.env[self.model]
             args = self.args_json or []
             kwargs = self.kwargs_json or {}
-            record_ids = kwargs.pop("_record_ids", None)
+            record_ids = kwargs.pop("_record_ids", [])
             records = model.browse(record_ids).with_context(**context).with_user(self.create_uid)
-            result = getattr(records, self.method)(*args, **kwargs)
 
-            self.write(
-                {
-                    "state": "done",
-                    "end_time": fields.Datetime.now(),
-                }
-            )
+            # Execute the method and capture the result
+            result = getattr(records, self.method)(*args, **kwargs)
+            self.finish()
             if result:
                 self._notify_user(result)
                 self.env.cr.commit()  # pylint: disable=invalid-commit
@@ -180,7 +198,72 @@ class BgJob(models.Model):
             self._handle_job_error(e)
             raise
 
-    def _handle_job_error(self, error: Exception):
+    def enqueue(self, retry: bool = False):
+        """Mark the job as enqueued."""
+        data = {
+            "state": "enqueued",
+        }
+        if retry:
+            data.update(
+                {
+                    "retry_count": 0,
+                    "error_message": False,
+                }
+            )
+        self.write(data)
+
+    def start(self):
+        """Mark the job as running and set the start time."""
+        self.write(
+            {
+                "state": "running",
+                "start_time": fields.Datetime.now(),
+            }
+        )
+
+    def finish(self):
+        """
+        Mark the job as done and set the end time.
+        Also enqueue the next job in the batch if it exists.
+        """
+        self.write(
+            {
+                "state": "done",
+                "end_time": fields.Datetime.now(),
+            }
+        )
+        self.filtered("next_job_id").mapped("next_job_id").enqueue()
+        self.env["base.bg"].sudo()._trigger_crons()
+
+    def wait(self):
+        """Mark the job as waiting for the previous job to complete."""
+        self.write(
+            {
+                "state": "waiting",
+            }
+        )
+
+    def fail(self, error_message: str):
+        """Mark the job as failed with an error message."""
+        self.write(
+            {
+                "state": "failed",
+                "end_time": fields.Datetime.now(),
+                "error_message": error_message,
+            }
+        )
+
+    def cancel(self, message: str | None = None):
+        """Cancel the jobs received."""
+        self.write(
+            {
+                "state": "canceled",
+                "cancel_time": fields.Datetime.now(),
+                "error_message": message,
+            }
+        )
+
+    def _handle_job_error(self, error: Exception | str):
         """
         Handle job execution error
 
@@ -189,21 +272,12 @@ class BgJob(models.Model):
         error_msg = str(error)
         self.retry_count += 1
         if self.retry_count < self.max_retries:
-            self.write(
-                {
-                    "state": "enqueued",
-                }
-            )
+            self.enqueue()
             _logger.warning("Job %s failed, scheduling retry #%d: %s", self.name, self.retry_count, error_msg)
         else:
             # Max retries reached, mark as failed
-            self.write(
-                {
-                    "state": "failed",
-                    "end_time": fields.Datetime.now(),
-                    "error_message": error_msg,
-                }
-            )
+            self.fail(error_msg)
+            self._get_next_jobs().cancel(message=_("Previous job in batch failed"))
             _logger.error("Job %s failed permanently: %s", self.name, error_msg)
 
     def _notify_user(self, result: str):
@@ -220,6 +294,20 @@ class BgJob(models.Model):
             message_type="comment",
             subtype_xmlid="mail.mt_comment",
         )
+
+    def _get_next_jobs(self) -> "BgJob":
+        """
+        Get the next jobs in the same batch.
+
+        :return: Recordset of next jobs in the batch
+        """
+        self.ensure_one()
+        current_job = self
+        jobs = self.env["bg.job"]
+        while current_job.next_job_id:
+            jobs |= current_job.next_job_id
+            current_job = current_job.next_job_id
+        return jobs
 
     @api.model
     def _cron_run_enqueued_jobs(self, limit: int = 5):
@@ -261,6 +349,7 @@ class BgJob(models.Model):
             ]
         )
         for job in jobs:
-            job.write({"state": "failed", "error_message": _("Job timed out")})
-            message = _("Job %s timed out") % job.name
-            job._notify_user(message)
+            job._handle_job_error(_("Job timed out"))
+            if job.state == "failed":
+                message = _("Job %s timed out") % job._get_html_link(title=job.name)
+                job._notify_user(message)
