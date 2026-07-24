@@ -14,6 +14,8 @@ class DateTimeEncoder(json.JSONEncoder):
     def default(self, obj):
         if isinstance(obj, (datetime, date, time)):
             return obj.isoformat()
+        if isinstance(obj, (bytes, bytearray, memoryview)):
+            return base64.b64encode(bytes(obj)).decode()
         return super().default(obj)
 
 
@@ -39,8 +41,14 @@ class Base(models.AbstractModel):
                 ]
             )
 
+        # Extract field names considering import_compat mode
+        import_compat = params.get("import_compat", True)
         field_names = [f.get("name") or f.get("value") or f.get("id") for f in params["fields"]]
-        field_labels = [f.get("label") or f.get("string") for f in params["fields"]]
+        if import_compat:
+            field_labels = field_names
+        else:
+            field_names = [f.get("name") or f.get("id") for f in params["fields"]]
+            field_labels = [f.get("label") or f.get("string") for f in params["fields"]]
 
         export_data = self.export_data(field_names).get("datas", [])
 
@@ -85,20 +93,28 @@ class IrModel(models.Model):
         The last job combines all chunks into the final export file.
         """
         params = json.loads(data)
-        Model = self.env[params["model"]].with_context(**params.get("context", {}))
+        import_compat = params.get("import_compat", True)
+        Model = self.env[params["model"]].with_context(import_compat=import_compat, **params.get("context", {}))
         ids = params.get("ids")
         domain = params.get("domain", [])
         records = Model.browse(ids) if ids else Model.search(domain)
 
         export_id = str(uuid.uuid4())
 
-        return self.env["base.bg"].bg_enqueue_records(
-            records,
-            "_export_chunk_bg",
-            threshold=self.get_export_threshold(),
-            data=data,
-            export_id=export_id,
-            export_format=export_format,
+        # base.bg serializes its own env context into the job; propagate the
+        # exact model context used for export so nested relational fields are
+        # resolved exactly as in synchronous exports.
+        return (
+            self.env["base.bg"]
+            .with_context(**Model.env.context)
+            .bg_enqueue_records(
+                records,
+                "_export_chunk_bg",
+                threshold=self.get_export_threshold(),
+                data=data,
+                export_id=export_id,
+                export_format=export_format,
+            )
         )
 
     def _combine_chunks(self, export_id, export_format):
@@ -129,7 +145,8 @@ class IrModel(models.Model):
                     ws.write_row(0, 0, chunk_data["headers"])
                     row_num = 1
                 for row in chunk_data["rows"]:
-                    ws.write_row(row_num, 0, row)
+                    cleaned_row = [str(cell) if isinstance(cell, (dict, list)) else cell for cell in row]
+                    ws.write_row(row_num, 0, cleaned_row)
                     row_num += 1
             wb.close()
             chunks.unlink()

@@ -1,6 +1,6 @@
 ##############################################################################
 #
-#    Copyright (C) 2019  ADHOC SA  (http://www.adhoc.com.ar)
+#    Copyright (C) 2026  ADHOC SA  (http://www.adhoc.com.ar)
 #    All Rights Reserved.
 #
 #    This program is free software: you can redistribute it and/or modify
@@ -18,32 +18,20 @@
 #
 ##############################################################################
 {
-    "name": "Mail UX",
-    "version": "18.0.1.4.0",
-    "category": "Base",
-    "sequence": 14,
-    "summary": "",
+    "name": "Account Reconcile Background",
+    "version": "18.0.1.0.0",
+    "category": "Accounting",
     "author": "ADHOC SA",
-    "website": "www.adhoc.com.ar",
+    "website": "https://www.adhoc.com.ar",
     "license": "AGPL-3",
-    "images": [],
-    "assets": {
-        "web.assets_backend": [
-            "mail_ux/static/src/core/common/**/*",
-        ],
-    },
+    "summary": "Process bank reconciliation in background for large payment batches",
     "depends": [
-        "mail",
+        "account_accountant",
+        "base_bg",
     ],
     "data": [
-        "security/ir.model.access.csv",
-        "wizard/mail_server_test_wizard_views.xml",
-        "views/ir_mail_server_views.xml",
-        "views/res_users_views.xml",
+        "data/ir_config_parameter_data.xml",
     ],
-    "demo": [],
-    "test": [],
     "installable": True,
     "auto_install": False,
-    "application": False,
 }
