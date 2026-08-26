@@ -43,8 +43,6 @@
         ],
     },
     "installable": True,
-    # BTL: auto_install vypnut -- modul meni importni UI globalne pro vsechny firmy
-    # a v 18.0 nasazeny nebyl; instalovat jen vedome. R-17663
     "auto_install": False,
     "application": False,
 }
