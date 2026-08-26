@@ -19,7 +19,7 @@
 ##############################################################################
 {
     "name": "Mail UX",
-    "version": "19.0.1.0.0",
+    "version": "19.0.1.2.0",
     "category": "Base",
     "sequence": 14,
     "summary": "",
@@ -36,6 +36,9 @@
         "mail",
     ],
     "data": [
+        "security/ir.model.access.csv",
+        "wizard/mail_server_test_wizard_views.xml",
+        "views/ir_mail_server_views.xml",
         "views/res_users_views.xml",
     ],
     "demo": [],

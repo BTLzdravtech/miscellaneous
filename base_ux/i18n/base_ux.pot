@@ -6,14 +6,20 @@ msgid ""
 msgstr ""
 "Project-Id-Version: Odoo Server 19.0+e\n"
 "Report-Msgid-Bugs-To: \n"
-"POT-Creation-Date: 2025-11-21 10:10+0000\n"
-"PO-Revision-Date: 2025-11-21 10:10+0000\n"
+"POT-Creation-Date: 2026-07-31 18:53+0000\n"
+"PO-Revision-Date: 2026-07-31 18:53+0000\n"
 "Last-Translator: \n"
 "Language-Team: \n"
 "MIME-Version: 1.0\n"
 "Content-Type: text/plain; charset=UTF-8\n"
 "Content-Transfer-Encoding: \n"
 "Plural-Forms: \n"
+
+#. module: base_ux
+#: model_terms:ir.ui.view,arch_db:base_ux.mail_activity_schedule_view_form_inherit
+#: model_terms:ir.ui.view,arch_db:base_ux.mail_activity_view_form_popup_inherit
+msgid "<small class=\"text-muted\">¿No encontrás el tipo que buscas?</small>"
+msgstr ""
 
 #. module: base_ux
 #: model:ir.model,name:base_ux.model_ir_actions_act_window
@@ -35,6 +41,16 @@ msgid "Activity"
 msgstr ""
 
 #. module: base_ux
+#: model:ir.model,name:base_ux.model_mail_activity_type
+msgid "Activity Type"
+msgstr ""
+
+#. module: base_ux
+#: model:ir.model,name:base_ux.model_mail_activity_schedule
+msgid "Activity schedule plan Wizard"
+msgstr ""
+
+#. module: base_ux
 #: model_terms:ir.ui.view,arch_db:base_ux.view_window_action_form
 msgid "Add in the 'Action' menu"
 msgstr ""
@@ -43,6 +59,12 @@ msgstr ""
 #: model_terms:ir.ui.view,arch_db:base_ux.view_company_search
 #: model_terms:ir.ui.view,arch_db:base_ux.view_mail_template_search
 msgid "Archived"
+msgstr ""
+
+#. module: base_ux
+#: model_terms:ir.ui.view,arch_db:base_ux.mail_activity_schedule_view_form_inherit
+#: model_terms:ir.ui.view,arch_db:base_ux.mail_activity_view_form_popup_inherit
+msgid "Buscar otro tipo de actividad..."
 msgstr ""
 
 #. module: base_ux
@@ -61,9 +83,12 @@ msgid "Country state"
 msgstr ""
 
 #. module: base_ux
+#: model:ir.model.fields,field_description:base_ux.field_base_partner_merge_automatic_wizard__display_name
 #: model:ir.model.fields,field_description:base_ux.field_ir_actions_act_window__display_name
 #: model:ir.model.fields,field_description:base_ux.field_ir_actions_server__display_name
 #: model:ir.model.fields,field_description:base_ux.field_mail_activity__display_name
+#: model:ir.model.fields,field_description:base_ux.field_mail_activity_schedule__display_name
+#: model:ir.model.fields,field_description:base_ux.field_mail_activity_type__display_name
 #: model:ir.model.fields,field_description:base_ux.field_mail_template__display_name
 #: model:ir.model.fields,field_description:base_ux.field_res_company__display_name
 #: model:ir.model.fields,field_description:base_ux.field_res_country_state__display_name
@@ -82,14 +107,40 @@ msgid "Email Templates"
 msgstr ""
 
 #. module: base_ux
+#: model:ir.model.fields,field_description:base_ux.field_base_partner_merge_automatic_wizard__id
 #: model:ir.model.fields,field_description:base_ux.field_ir_actions_act_window__id
 #: model:ir.model.fields,field_description:base_ux.field_ir_actions_server__id
 #: model:ir.model.fields,field_description:base_ux.field_mail_activity__id
+#: model:ir.model.fields,field_description:base_ux.field_mail_activity_schedule__id
+#: model:ir.model.fields,field_description:base_ux.field_mail_activity_type__id
 #: model:ir.model.fields,field_description:base_ux.field_mail_template__id
 #: model:ir.model.fields,field_description:base_ux.field_res_company__id
 #: model:ir.model.fields,field_description:base_ux.field_res_country_state__id
 #: model:ir.model.fields,field_description:base_ux.field_res_partner__id
 msgid "ID"
+msgstr ""
+
+#. module: base_ux
+#: model:ir.model.fields,help:base_ux.field_mail_activity__quick_activity_ids
+#: model:ir.model.fields,help:base_ux.field_mail_activity_schedule__quick_activity_ids
+msgid "IDs de los tipos de actividad más frecuentes para mostrar como badges."
+msgstr ""
+
+#. module: base_ux
+#. odoo-python
+#: code:addons/base_ux/models/res_partner.py:0
+msgid "Import Template for Contacts"
+msgstr ""
+
+#. module: base_ux
+#: model:ir.model,name:base_ux.model_base_partner_merge_automatic_wizard
+msgid "Merge Partner Wizard"
+msgstr ""
+
+#. module: base_ux
+#: model:ir.model.fields,field_description:base_ux.field_mail_activity__quick_activity_ids
+#: model:ir.model.fields,field_description:base_ux.field_mail_activity_schedule__quick_activity_ids
+msgid "Quick Activity"
 msgstr ""
 
 #. module: base_ux
@@ -100,6 +151,12 @@ msgstr ""
 #. module: base_ux
 #: model_terms:ir.ui.view,arch_db:base_ux.view_window_action_form
 msgid "Remove the contextual action related this action"
+msgstr ""
+
+#. module: base_ux
+#. odoo-javascript
+#: code:addons/base_ux/static/src/model_field_selector/model_field_selector.xml:0
+msgid "Select a field..."
 msgstr ""
 
 #. module: base_ux
