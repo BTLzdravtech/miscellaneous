@@ -110,6 +110,108 @@ class TestBgJob(TransactionCase):
         job = self.BgJob.browse(job.id)
         self.assertEqual(job.state, "failed")
 
+    def test_fail_notifies_when_records_were_deleted(self):
+        """fail() must not raise when the job outlived the records it points to."""
+        partner = self.env["res.partner"].create({"name": "Gone"})
+        job = self._create_job(name="Orphan Job", state="running", kwargs_json={"_record_ids": [partner.id]})
+        partner.unlink()  # linking it in the notification would read display_name and raise
+
+        job.fail("boom")
+
+        self.assertEqual(job.state, "failed")
+        self.assertEqual(job.error_message, "boom")
+
+    def _create_timed_out_job(self, name, **vals):
+        """Build a running job whose start_time is already past any cron timeout."""
+        old_time = fields.Datetime.now() - timedelta(hours=6)
+        return self._create_job(name=name, state="running", start_time=old_time, max_retries=1, **vals)
+
+    def test_cron_check_running_jobs_skips_poisoned_job(self):
+        """A job that raises while being timed out must not abort the reaper for the rest."""
+        poisoned = self._create_timed_out_job("Poisoned Job")
+        chained = self._create_job(name="Chained Job", batch_key=poisoned.batch_key, state="waiting")
+        poisoned.next_job_id = chained.id
+        healthy = self._create_timed_out_job("Healthy Job")
+        base_fail = type(self.BgJob).fail
+
+        def poisoned_fail(job_self, error_message, notify=True):
+            """Stand in for a model override of fail() that raises (the real-world poison)."""
+            if job_self.name == "Poisoned Job":
+                raise ValueError("boom while failing the job")
+            return base_fail(job_self, error_message, notify=notify)
+
+        self._set_cron_timeout(300)
+        with patch.object(type(self.BgJob), "fail", poisoned_fail), tools.mute_logger(
+            "odoo.addons.base_bg.models.bg_job"
+        ):
+            self.BgJob._cron_check_running_jobs()
+
+        self.assertEqual(poisoned.state, "failed", "the poisoned job is bare-failed instead of poisoning every run")
+        self.assertEqual(chained.state, "canceled", "its batch is cancelled, as on any other permanent failure")
+        self.assertEqual(healthy.state, "failed", "the remaining jobs are still timed out")
+
+    def test_cron_check_running_jobs_defers_transient_error(self):
+        """A transient PG error is not a poisoned job: the job is left for the next run."""
+        job = self._create_timed_out_job("Contended Job")
+
+        self._set_cron_timeout(300)
+        with patch.object(
+            type(self.BgJob), "_handle_job_error", side_effect=self._serialization_error()
+        ), tools.mute_logger("odoo.addons.base_bg.models.bg_job"):
+            self.BgJob._cron_check_running_jobs()
+
+        self.assertEqual(job.state, "running")
+
+    def test_run_cancels_orphaned_job(self):
+        """run() cancels a job whose records were all deleted, along with the rest of its batch."""
+        partner = self.env["res.partner"].create({"name": "Gone"})
+        job = self._create_job(name="Orphan Run Job", state="running", kwargs_json={"_record_ids": [partner.id]})
+        chained = self._create_job(name="Chained After Orphan", batch_key=job.batch_key, state="waiting")
+        job.next_job_id = chained.id
+        partner.unlink()
+
+        with patch.object(type(self.BgJob), "_notify_user") as mock_notify:
+            job.run()
+
+        self.assertEqual(job.state, "canceled", "an orphan job is canceled, not failed")
+        self.assertEqual(chained.state, "canceled")
+        mock_notify.assert_not_called()
+
+    def test_run_with_partially_deleted_records_is_not_orphaned(self):
+        """One surviving record is enough: the job is not an orphan and runs normally."""
+        keep = self.env["res.partner"].create({"name": "Keep"})
+        gone = self.env["res.partner"].create({"name": "Gone"})
+        job = self._create_job(state="running", kwargs_json={"_record_ids": [keep.id, gone.id]})
+        gone.unlink()
+
+        with patch.object(self.env.cr, "commit"), patch.object(type(self.BgJob), "_notify_user"):
+            job.run()
+
+        self.assertEqual(job.state, "done")
+
+    def test_run_with_no_records_is_not_orphaned(self):
+        """A job that points to no records at all (model-level method) runs normally."""
+        job = self._create_job(state="running", kwargs_json={"_record_ids": []})
+
+        with patch.object(self.env.cr, "commit"):
+            job.run()
+
+        self.assertEqual(job.state, "done")
+
+    def test_cron_check_running_jobs_cancels_orphaned_job(self):
+        """The reaper cancels a timed-out job whose records are gone, and still times out the rest."""
+        partner = self.env["res.partner"].create({"name": "Gone"})
+        orphan = self._create_timed_out_job("Orphan Timed Out", kwargs_json={"_record_ids": [partner.id]})
+        healthy = self._create_timed_out_job("Healthy Timed Out")
+        partner.unlink()
+
+        self._set_cron_timeout(300)
+        with patch.object(type(self.BgJob), "_notify_user"), tools.mute_logger("odoo.addons.base_bg.models.bg_job"):
+            self.BgJob._cron_check_running_jobs()
+
+        self.assertEqual(orphan.state, "canceled", "an orphan job is canceled, not failed")
+        self.assertEqual(healthy.state, "failed")
+
     def test_cron_check_running_jobs_recent(self):
         """Test that recent running jobs are not marked as timed out."""
         # Create a job that started recently
@@ -568,3 +670,207 @@ class TestBgJob(TransactionCase):
         # Not retried, and the transaction is rolled back before propagating.
         self.assertEqual(mock_get.call_count, 1)
         mock_rollback.assert_called_once()
+
+    # --- Serialization backoff, eligibility and runner memory cleanup -------
+
+    def _serialization_error(self):
+        """Build a real psycopg2 serialization failure (SQLSTATE 40001)."""
+        return psycopg2.errors.SerializationFailure("could not serialize access due to concurrent update")
+
+    def _set_param(self, key, value):
+        """Set a system parameter and restore its prior state on cleanup.
+
+        ir.config_parameter is cached in a process-global ormcache that survives
+        the TransactionCase rollback, so tests must undo their own set_param.
+        """
+        icp = self.env["ir.config_parameter"].sudo()
+        original = icp.get_param(key, False)
+
+        def _restore():
+            if original is False:
+                param = icp.search([("key", "=", key)])
+                if param:
+                    param.unlink()
+            else:
+                icp.set_param(key, original)
+
+        self.addCleanup(_restore)
+        icp.set_param(key, value)
+
+    def test_is_transient_error_detects_serialization(self):
+        """40001 failures are transient whether raw, chained via __cause__, or via __context__."""
+        job = self._create_job()
+        self.assertTrue(job._is_transient_error(self._serialization_error()))
+        # Wrapped with an explicit cause (raise ... from) ...
+        try:
+            try:
+                raise self._serialization_error()
+            except psycopg2.errors.SerializationFailure as exc:
+                raise ValueError("wrapped") from exc
+        except ValueError as chained:
+            self.assertTrue(job._is_transient_error(chained))
+        # ... and with implicit chaining (__context__)
+        try:
+            try:
+                raise self._serialization_error()
+            except psycopg2.errors.SerializationFailure:
+                raise ValueError("implicitly chained")
+        except ValueError as chained_ctx:
+            self.assertTrue(job._is_transient_error(chained_ctx))
+        # Unrelated exceptions, and plain strings that merely contain the phrase, are NOT transient
+        self.assertFalse(job._is_transient_error(ValueError("boom")))
+        self.assertFalse(job._is_transient_error("could not serialize access due to concurrent update"))
+
+    def test_transient_error_backs_off_and_reenqueues(self):
+        """A serialization failure re-enqueues with a future backoff gate and schedules a wake-up."""
+        job = self._create_job(name="Transient Job", state="running", max_retries=3)
+        with patch("odoo.addons.base_bg.models.bg_job._logger.warning"), patch.object(
+            type(self.env["base.bg"]), "_trigger_crons"
+        ) as mock_trigger:
+            requeued = job._handle_job_error(self._serialization_error())
+
+        self.assertTrue(requeued)
+        job.invalidate_recordset()
+        self.assertEqual(job.state, "enqueued")
+        self.assertEqual(job.transient_retry_count, 1)
+        self.assertEqual(job.retry_count, 1)
+        self.assertTrue(job.next_retry_at, "A backoff gate must be set for transient errors")
+        self.assertGreater(job.next_retry_at, fields.Datetime.now())
+        # A wake-up is scheduled for when the backoff elapses.
+        mock_trigger.assert_called_once()
+        self.assertIn("at", mock_trigger.call_args.kwargs)
+
+    def test_transient_error_does_not_consume_normal_retry_budget(self):
+        """Serialization retries use their own budget (default 10), not max_retries (3)."""
+        job = self._create_job(
+            name="Persistent Transient", state="running", max_retries=3, retry_count=5, transient_retry_count=5
+        )
+        with patch("odoo.addons.base_bg.models.bg_job._logger.warning"), patch.object(
+            type(self.env["base.bg"]), "_trigger_crons"
+        ):
+            requeued = job._handle_job_error(self._serialization_error())
+
+        self.assertTrue(requeued)
+        job.invalidate_recordset()
+        self.assertEqual(job.state, "enqueued")  # not failed despite retry_count > max_retries
+        self.assertEqual(job.transient_retry_count, 6)
+
+    def test_transient_error_fails_after_serialization_cap(self):
+        """Once the serialization retry budget is exhausted, the job fails permanently."""
+        self._set_param("base_bg.transient_max_retries", "3")
+        job = self._create_job(name="Exhausted Transient", state="running", retry_count=2, transient_retry_count=2)
+        with patch("odoo.addons.base_bg.models.bg_job._logger.error"):
+            requeued = job._handle_job_error(self._serialization_error())
+
+        self.assertFalse(requeued)
+        job.invalidate_recordset()
+        self.assertEqual(job.state, "failed")
+
+    def test_non_transient_error_keeps_immediate_retry(self):
+        """Non-serialization errors keep the original retry-then-fail behavior, no backoff gate."""
+        job = self._create_job(name="Real Error Job", state="running", max_retries=2)
+        with patch("odoo.addons.base_bg.models.bg_job._logger.warning"):
+            requeued = job._handle_job_error("Some real failure")
+
+        self.assertTrue(requeued)
+        job.invalidate_recordset()
+        self.assertEqual(job.state, "enqueued")
+        self.assertEqual(job.retry_count, 1)
+        self.assertEqual(job.transient_retry_count, 0)
+        self.assertFalse(job.next_retry_at, "Non-transient retries must not set a backoff gate")
+
+    def test_transient_retries_do_not_starve_real_error_budget(self):
+        """A job that burned transient retries still gets its full non-transient budget."""
+        job = self._create_job(name="Mixed", state="running", max_retries=3, retry_count=4, transient_retry_count=4)
+        with patch("odoo.addons.base_bg.models.bg_job._logger.warning"):
+            requeued = job._handle_job_error("A genuine business error")
+
+        self.assertTrue(requeued, "the first real error must retry even after transient retries")
+        job.invalidate_recordset()
+        self.assertEqual(job.state, "enqueued")
+        self.assertEqual(job.retry_count, 5)  # non-transient attempts = 5 - 4 = 1 < max_retries(3)
+
+    def test_malformed_int_param_falls_back_to_default(self):
+        """A non-integer system parameter must not crash the runner; it falls back to the default."""
+        self._set_param("base_bg.transient_max_retries", "not-a-number")
+        with patch("odoo.addons.base_bg.models.bg_job._logger.warning"):
+            self.assertEqual(self.BgJob._get_transient_max_retries(), 10)
+
+    def test_fail_and_cancel_clear_backoff_gate(self):
+        """fail() and cancel() clear next_retry_at so no stale gate lingers on the row."""
+        future = fields.Datetime.now() + timedelta(minutes=5)
+        job = self._create_job(name="Fail Clears Gate", state="running", next_retry_at=future)
+        job.fail("done for", notify=False)
+        job.invalidate_recordset()
+        self.assertFalse(job.next_retry_at)
+
+        job2 = self._create_job(name="Cancel Clears Gate", state="enqueued", next_retry_at=future)
+        job2.cancel("nope")
+        job2.invalidate_recordset()
+        self.assertFalse(job2.next_retry_at)
+
+    def test_get_next_job_skips_jobs_in_backoff(self):
+        """Jobs whose backoff window is still in the future are not picked up."""
+        self.BgJob.search([("state", "=", "enqueued")]).write({"state": "canceled"})
+        future = fields.Datetime.now() + timedelta(minutes=10)
+        self._create_job(name="Backing Off", state="enqueued", next_retry_at=future)
+        self.assertEqual(self.BgJob._get_next_job(), self.env["bg.job"])
+
+        eligible = self._create_job(name="Ready", state="enqueued")
+        self.assertEqual(self.BgJob._get_next_job(), eligible)
+
+    def test_finish_does_not_trigger_cron(self):
+        """finish() must not hammer the cron on every completed job."""
+        job = self._create_job(name="Finish No Trigger", state="running")
+        with patch.object(type(self.env["base.bg"]), "_trigger_crons") as mock_trigger:
+            job.finish()
+
+        job.invalidate_recordset()
+        self.assertEqual(job.state, "done")
+        mock_trigger.assert_not_called()
+
+    def test_finish_enqueues_next_and_marks_it_eligible(self):
+        """finish() enqueues the next batch job, which the runner then sees as eligible."""
+        self.BgJob.search([("state", "=", "enqueued")]).write({"state": "canceled"})
+        job1 = self._create_job(name="Batch head", state="running")
+        job2 = self._create_job(name="Batch tail", state="waiting")
+        job1.next_job_id = job2
+        job1.finish()
+
+        job2.invalidate_recordset()
+        self.assertEqual(job2.state, "enqueued")
+        self.assertTrue(self.BgJob._has_eligible_jobs(), "the freshly-enqueued next job must be pickable")
+
+    def test_run_releases_orm_cache(self):
+        """run() drops the ORM cache after each job (success and error) to flatten the
+        long-lived runner's memory between jobs."""
+        # Success path
+        partner = self.env["res.partner"].create({"name": "Mem partner"})
+        ok_job = self._create_job(
+            name="Mem OK",
+            state="running",
+            model="res.partner",
+            method="exists",
+            kwargs_json={"_record_ids": [partner.id]},
+        )
+        with patch.object(self.env.cr, "commit"), patch.object(type(ok_job), "_notify_user"), patch.object(
+            type(self.env), "invalidate_all"
+        ) as mock_inv:
+            ok_job.run()
+        mock_inv.assert_called()
+
+        # Error path
+        err_job = self._create_job(
+            name="Mem ERR",
+            state="running",
+            model="bg.job",
+            method="dummy_boom",
+            kwargs_json={"_record_ids": [ok_job.id]},
+        )
+        with patch.object(type(err_job), "dummy_boom", create=True, side_effect=ValueError("boom")), patch.object(
+            self.env.cr, "commit"
+        ), patch.object(self.env.cr, "rollback"), patch(
+            "odoo.addons.base_bg.models.bg_job._logger.warning"
+        ), patch.object(type(self.env), "invalidate_all") as mock_inv_err:
+            err_job.run()
+        mock_inv_err.assert_called()
