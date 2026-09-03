@@ -7,9 +7,10 @@ from unittest.mock import patch
 from uuid import uuid4
 
 import psycopg2
+from markupsafe import Markup
 from odoo import fields, tools
 from odoo.addons.base_bg.models.base_bg import BaseBg
-from odoo.addons.base_bg.models.bg_job import MAX_ACQUIRE_RETRIES
+from odoo.addons.base_bg.models.bg_job import MAX_ACQUIRE_RETRIES, ORPHAN_SWEEP_GRACE
 from odoo.exceptions import UserError
 from odoo.tests.common import TransactionCase
 
@@ -21,10 +22,14 @@ class TestBgJob(TransactionCase):
         self.BgJob = self.env["bg.job"]
         self.base_bg_model = self.env["base.bg"]
         self._limit_time_real_cron = tools.config.get("limit_time_real_cron", 120)
+        self._limit_time_real = tools.config.get("limit_time_real")
+        self._workers = tools.config.get("workers")
 
     def tearDown(self):
-        """Restore original cron timeout and teardown TransactionCase."""
+        """Restore original time limits / server mode and teardown TransactionCase."""
         tools.config["limit_time_real_cron"] = self._limit_time_real_cron
+        tools.config["limit_time_real"] = self._limit_time_real
+        tools.config["workers"] = self._workers
         super().tearDown()
 
     def _set_cron_timeout(self, minutes: int):
@@ -121,10 +126,60 @@ class TestBgJob(TransactionCase):
         self.assertEqual(job.state, "failed")
         self.assertEqual(job.error_message, "boom")
 
+    def test_fail_notification_escapes_user_data(self):
+        """HTML in the job name or error message must reach the DM inert, not injected."""
+        job = self._create_job(name="<img src=x onerror=alert(1)>", state="running")
+
+        with patch.object(type(self.BgJob), "_notify_user") as mock_notify:
+            job.fail("boom <MissingRecord res.partner>")
+
+        message = mock_notify.call_args[0][0]
+        self.assertIsInstance(message, Markup)
+        self.assertNotIn("<img", str(message))
+        self.assertIn("&lt;MissingRecord res.partner&gt;", str(message))
+        # the job link itself stays clickable
+        self.assertIn("data-oe-id", str(message))
+
+    def test_notify_user_escapes_plain_strings(self):
+        """A plain-string result is escaped; a Markup result keeps its HTML."""
+        job = self._create_job()
+        channel = (
+            self.env["discuss.channel"]
+            .with_user(job.create_uid)
+            .sudo()
+            ._get_or_create_chat([job.create_uid.partner_id.id])
+        )
+
+        job._notify_user("plain <b>bold</b>")
+        plain_body = str(channel.message_ids[0].body)
+        self.assertNotIn("<b>", plain_body)
+        self.assertIn("&lt;b&gt;", plain_body)
+
+        job._notify_user(Markup("<b>bold</b>"))
+        markup_body = str(channel.message_ids[0].body)
+        self.assertIn("<b>bold</b>", markup_body)
+
     def _create_timed_out_job(self, name, **vals):
         """Build a running job whose start_time is already past any cron timeout."""
         old_time = fields.Datetime.now() - timedelta(hours=6)
         return self._create_job(name=name, state="running", start_time=old_time, max_retries=1, **vals)
+
+    def test_cron_check_running_jobs_notifies_once_on_permanent_timeout(self):
+        """A permanently timed-out job must DM its creator once, not twice."""
+        job = self._create_timed_out_job("Timed Out Once")
+
+        self._set_cron_timeout(300)
+        with patch.object(type(self.BgJob), "_notify_user") as mock_notify, tools.mute_logger(
+            "odoo.addons.base_bg.models.bg_job"
+        ):
+            self.BgJob._cron_check_running_jobs()
+
+        self.assertEqual(job.state, "failed")
+        mock_notify.assert_called_once()
+        # the single message keeps a clickable reference to the job
+        message = mock_notify.call_args[0][0]
+        self.assertIn("Timed Out Once", message)
+        self.assertIn("data-oe-id", message)
 
     def test_cron_check_running_jobs_skips_poisoned_job(self):
         """A job that raises while being timed out must not abort the reaper for the rest."""
@@ -225,6 +280,92 @@ class TestBgJob(TransactionCase):
         # Refresh the job from database
         job = self.BgJob.browse(job.id)
         self.assertEqual(job.state, "running")  # Should still be running
+
+    def test_cron_check_running_jobs_default_config_falls_back_to_limit_time_real(self):
+        """-1 (the core default) must inherit --limit-time-real, not reap every running job."""
+        recent = self._create_job(
+            name="Recent Under Fallback",
+            state="running",
+            start_time=fields.Datetime.now() - timedelta(minutes=30),
+        )
+        stale = self._create_timed_out_job("Stale Under Fallback")
+        tools.config["limit_time_real_cron"] = -1
+        tools.config["limit_time_real"] = 3600
+        with patch.object(type(self.BgJob), "_notify_user"), tools.mute_logger("odoo.addons.base_bg.models.bg_job"):
+            self.BgJob._cron_check_running_jobs()
+        self.assertEqual(recent.state, "running")
+        self.assertEqual(stale.state, "failed")
+
+    def test_cron_check_running_jobs_without_time_limit_reaps_nothing(self):
+        """In prefork, 0 disables the cron time limit: the reaper must leave running jobs alone."""
+        stale = self._create_timed_out_job("Stale Without Limit")
+        tools.config["workers"] = 4
+        tools.config["limit_time_real_cron"] = 0
+        self.BgJob._cron_check_running_jobs()
+        self.assertEqual(stale.state, "running")
+
+        # -1 falling back to a limit_time_real of 0 disables it just the same
+        tools.config["limit_time_real_cron"] = -1
+        tools.config["limit_time_real"] = 0
+        self.BgJob._cron_check_running_jobs()
+        self.assertEqual(stale.state, "running")
+
+    def test_cron_check_running_jobs_threaded_zero_falls_back_to_limit_time_real(self):
+        """In threaded mode 0 is not "no limit": the core falls back to --limit-time-real."""
+        stale = self._create_timed_out_job("Stale Threaded Zero")
+        tools.config["workers"] = 0
+        tools.config["limit_time_real_cron"] = 0
+        tools.config["limit_time_real"] = 3600
+        with patch.object(type(self.BgJob), "_notify_user"), tools.mute_logger("odoo.addons.base_bg.models.bg_job"):
+            self.BgJob._cron_check_running_jobs()
+        self.assertEqual(stale.state, "failed")
+
+    def test_cron_check_running_jobs_without_time_limit_still_cancels_orphans(self):
+        """No time limit must not turn off the orphan sweep: stuck orphans block their batch."""
+        partner = self.env["res.partner"].create({"name": "Gone"})
+        orphan = self._create_timed_out_job("Orphan Without Limit", kwargs_json={"_record_ids": [partner.id]})
+        chained = self._create_job(name="Chained After Orphan", batch_key=orphan.batch_key, state="waiting")
+        orphan.next_job_id = chained.id
+        partner.unlink()
+        tools.config["workers"] = 4
+        tools.config["limit_time_real_cron"] = 0
+
+        self.BgJob._cron_check_running_jobs()
+
+        self.assertEqual(orphan.state, "canceled", "an orphan job is canceled even with no time limit")
+        self.assertEqual(chained.state, "canceled")
+
+    def test_cron_check_running_jobs_spares_freshly_started_orphan(self):
+        """A job whose records just vanished may still be running: the sweep waits for its floor."""
+        partner = self.env["res.partner"].create({"name": "Gone Mid Run"})
+        job = self._create_job(
+            name="Orphan In Flight",
+            state="running",
+            start_time=fields.Datetime.now(),
+            kwargs_json={"_record_ids": [partner.id]},
+        )
+        chained = self._create_job(name="Chained After In Flight", batch_key=job.batch_key, state="waiting")
+        job.next_job_id = chained.id
+        partner.unlink()
+
+        # with a limit configured the sweep uses it as its floor
+        self._set_cron_timeout(60)
+        self.BgJob._cron_check_running_jobs()
+        self.assertEqual(job.state, "running", "an orphan still within the limit is not canceled in flight")
+        self.assertEqual(chained.state, "waiting")
+
+        # and with no limit at all it falls back to ORPHAN_SWEEP_GRACE
+        tools.config["workers"] = 4
+        tools.config["limit_time_real_cron"] = 0
+        self.BgJob._cron_check_running_jobs()
+        self.assertEqual(job.state, "running")
+        self.assertEqual(chained.state, "waiting")
+
+        # past the grace it is swept as before
+        job.start_time = fields.Datetime.now() - timedelta(seconds=ORPHAN_SWEEP_GRACE + 1)
+        self.BgJob._cron_check_running_jobs()
+        self.assertEqual(job.state, "canceled")
+        self.assertEqual(chained.state, "canceled")
 
     def test_jobs_are_sorted_by_priority(self):
         """Jobs with lower priority value should be returned first."""

@@ -7,7 +7,7 @@ import random
 from datetime import timedelta
 
 import psycopg2
-from markupsafe import Markup
+from markupsafe import Markup, escape
 from odoo import _, api, fields, models, tools
 from odoo.exceptions import UserError
 from odoo.service.model import PG_CONCURRENCY_EXCEPTIONS_TO_RETRY
@@ -19,6 +19,13 @@ _logger = logging.getLogger(__name__)
 # transient contention instead of surrendering and rescheduling every cron at once
 # (trigger storm). Mirrors saas_provider.saas_database._acquire_next_task.
 MAX_ACQUIRE_RETRIES = 5
+
+# Fallback grace period (seconds) for the orphan sweep when no real-time limit is
+# configured at all. A job whose records vanished a moment ago may still be running
+# in another worker: cancelling it in flight lets its own finish() clobber the cancel
+# and resurrect the batch. With a limit configured the sweep uses that instead — past
+# it the worker would have been killed anyway, so the job is genuinely presumed dead.
+ORPHAN_SWEEP_GRACE = 3600
 
 
 class BgJob(models.Model):
@@ -274,13 +281,17 @@ class BgJob(models.Model):
             }
         )
         if notify:
-            message = _("Job %s failed: %s") % (self.name, error_message)
+            # Link the job itself: the failure DM is the only notification (the reaper
+            # does not re-notify) and the user needs a way to reach the failed job.
+            # escape() promotes the template to Markup, escaping the interpolations:
+            # error_message (often a traceback repr with angle brackets) is not HTML.
+            message = escape(_("Job %s failed: %s")) % (self._get_html_link(title=self.name), error_message)
             # exists(): a job can outlive its records, and browsing a dropped id is truthy —
             # _get_html_link() reads display_name on it and would raise MissingError.
             records = self._get_records().exists()
             if records:
                 links = [record._get_html_link() for record in records]
-                message += "<br/>" + _("Related records: %s") % (", ".join(links))
+                message += Markup("<br/>") + escape(_("Related records: %s")) % Markup(", ").join(links)
             self._notify_user(message)
 
     def cancel(self, message: str | None = None):
@@ -451,7 +462,8 @@ class BgJob(models.Model):
         """
         Notify user about job status
 
-        :param result: The result of the job execution
+        :param result: message to post. A plain string is escaped; pass a ``Markup``
+            (with any user-provided value already escaped) to render HTML.
         """
         channel = (
             self.env["discuss.channel"]
@@ -461,7 +473,7 @@ class BgJob(models.Model):
         )
         partner_root_id = self.env.ref("base.partner_root").id
         channel.message_post(
-            body=Markup(result),
+            body=escape(result),
             author_id=partner_root_id,
             message_type="comment",
             subtype_xmlid="mail.mt_comment",
@@ -570,33 +582,68 @@ class BgJob(models.Model):
             self.env["base.bg"].sudo()._trigger_crons()
 
     @api.model
+    def _get_reaper_timeout(self) -> int:
+        """
+        Effective real-time limit (seconds) for cron-run jobs, mirroring how the
+        server resolves ``limit_time_real_cron`` in each mode:
+
+        - prefork (``workers`` > 0): ``0``/unset means no limit, ``-1`` delegates
+          to ``--limit-time-real`` (``PreforkServer.__init__``).
+        - threaded (``workers`` == 0): the value only applies when > 0, anything
+          else falls back to ``--limit-time-real`` (``ThreadedServer.process_limit``).
+
+        :return: the limit, or 0 when there is none.
+        """
+        timeout = tools.config.get("limit_time_real_cron") or 0
+        if timeout > 0:
+            return timeout
+        if timeout == -1 or not tools.config.get("workers"):
+            return tools.config.get("limit_time_real") or 0
+        return 0
+
+    @api.model
     def _cron_check_running_jobs(self):
-        """Check running background jobs honoring the cron timeout (seconds)."""
-        timeout_seconds = tools.config.get("limit_time_real_cron") or 0
-        cutoff_date = fields.Datetime.now() - timedelta(seconds=timeout_seconds)
-        jobs = self.search(
-            [
-                ("start_time", "<", cutoff_date),
-                ("state", "=", "running"),
-            ]
-        )
+        """
+        Time out running jobs past the cron real-time limit, and cancel orphaned ones.
+
+        The orphan sweep is independent of the time limit: a running job whose
+        records are gone can never finish on its own, so it is swept even when no
+        limit is configured and nothing can ever time out. It keeps a floor of its
+        own (the limit, or ORPHAN_SWEEP_GRACE when there is none) so that a job that
+        just started is never cancelled while another worker is still running it.
+        """
+        now = fields.Datetime.now()
+        timeout_seconds = self._get_reaper_timeout()
+        cutoff_date = now - timedelta(seconds=timeout_seconds) if timeout_seconds > 0 else None
+        orphan_cutoff = cutoff_date or now - timedelta(seconds=ORPHAN_SWEEP_GRACE)
+        jobs = self.search([("state", "=", "running")])
         timeout_msg = _("Job timed out")
         for job in jobs:
             job_name = job.name
+            overdue = bool(cutoff_date and job.start_time and job.start_time < cutoff_date)
+            # A running job with no start_time cannot be dated: it is stuck by definition.
+            sweepable = not job.start_time or job.start_time < orphan_cutoff
             try:
                 # Per-job savepoint: a job that raises would otherwise abort the whole reaper
                 # and leave every other timed-out job running forever.
                 with self.env.cr.savepoint():
-                    if job._cancel_if_orphaned():
+                    if sweepable and job._cancel_if_orphaned():
                         continue
+                    if not overdue:
+                        continue
+                    # No extra notification here: when the job fails permanently,
+                    # _handle_job_error -> _give_up -> fail() already notifies the user once.
                     job._handle_job_error(timeout_msg)
-                    if job.state == "failed":
-                        job._notify_user(_("Job %s timed out") % job._get_html_link(title=job_name))
             except Exception as error:
                 # No invalidation needed: the savepoint rollback already cleared the cache
                 # and the pending updates (_FlushingSavepoint.rollback -> cr.clear()).
                 if self._is_transient_error(error):
                     _logger.warning("Job %s not timed out yet, transient error: %s", job_name, error)
+                    continue
+                if not overdue:
+                    # The bare-fail recovery below is for jobs already past their limit;
+                    # a job that merely failed its orphan check keeps running.
+                    _logger.exception("Could not check job %s, leaving it for the next run", job_name)
                     continue
                 _logger.exception("Could not time out job %s, giving up on it", job_name)
                 try:
