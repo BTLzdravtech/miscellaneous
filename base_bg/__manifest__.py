@@ -19,7 +19,7 @@
 ##############################################################################
 {
     "name": "Base Background Jobs",
-    "version": "19.0.1.1.0",
+    "version": "19.0.1.1.1",
     "category": "Technical",
     "author": "ADHOC SA",
     "website": "https://www.adhoc.com.ar",
@@ -30,6 +30,7 @@
         "mail",
     ],
     "data": [
+        "security/bg_job_security.xml",
         "security/ir.model.access.csv",
         "views/bg_job_views.xml",
         "data/ir_cron_data.xml",

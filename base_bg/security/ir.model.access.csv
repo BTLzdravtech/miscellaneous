@@ -1,3 +1,4 @@
 id,name,model_id:id,group_id:id,perm_read,perm_write,perm_create,perm_unlink
-access_bg_job_user,bg.job.user,model_bg_job,base.group_user,1,1,1,0
+access_bg_job_user,bg.job.user,model_bg_job,base.group_user,1,0,0,0
+access_bg_job_manager,bg.job.manager,model_bg_job,group_bg_job_manager,1,1,1,1
 access_bg_job_system,bg.job.system,model_bg_job,base.group_system,1,1,1,1

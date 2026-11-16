@@ -72,7 +72,7 @@ class BaseBg(models.AbstractModel):
             job_kwargs["_record_ids"] = list(chunk_ids) if chunk_ids else []
             job_vals["args_json"] = self.check_serializable(list(args)) if args else []
             job_vals["kwargs_json"] = self.check_serializable(job_kwargs)
-            job = self.env["bg.job"].create(job_vals)
+            job = self.env["bg.job"].sudo().create(job_vals)
             jobs |= job
             # Link previous job to current so sequence is established in one pass
             if prev_job:
