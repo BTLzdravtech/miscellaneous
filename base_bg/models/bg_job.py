@@ -9,7 +9,7 @@ from datetime import timedelta
 import psycopg2
 from markupsafe import Markup
 from odoo import _, api, fields, models, tools
-from odoo.exceptions import UserError
+from odoo.exceptions import AccessError, UserError
 from odoo.service.model import PG_CONCURRENCY_EXCEPTIONS_TO_RETRY
 
 _logger = logging.getLogger(__name__)
@@ -137,10 +137,12 @@ class BgJob(models.Model):
         Action to manually cancel enqueued jobs
         """
         self.ensure_one()
+        self._check_bg_job_owner()
         if self.state != "enqueued":
             raise UserError(_("Only enqueued jobs can be canceled"))
 
-        (self | self._get_next_jobs()).cancel()
+        job = self.sudo()
+        (job | job._get_next_jobs()).cancel()
 
     def action_retry(self):
         """
@@ -150,8 +152,16 @@ class BgJob(models.Model):
         if self.state != "failed":
             raise UserError(_("Only failed jobs can be retried"))
 
-        self.enqueue(retry=True)
-        self._get_next_jobs().wait()
+        self._check_bg_job_owner()
+        job = self.sudo()
+        job.enqueue(retry=True)
+        job._get_next_jobs().wait()
+
+    def _check_bg_job_owner(self):
+        if self.env.is_superuser() or self.env.user.has_group("base_bg.group_bg_job_manager"):
+            return
+        if self.filtered(lambda job: job.create_uid != self.env.user):
+            raise AccessError(_("You can only manage your own background jobs."))
 
     def action_open_records(self) -> dict:
         """
@@ -192,6 +202,10 @@ class BgJob(models.Model):
         cache flattens the runner's memory curve between jobs.
         """
         self.ensure_one()
+        if not self.env.is_superuser():
+            raise AccessError(_("Background jobs can only be executed by the job runner."))
+        if (self.method or "").startswith("_"):
+            raise AccessError(_("Background jobs cannot call private methods."))
         if self.state != "running":
             raise UserError(_("Only running jobs can be executed"))
 
